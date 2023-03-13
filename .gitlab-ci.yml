@@ -1,0 +1,88 @@
+---
+image:
+  name: hashicorp/terraform:1.0.11
+  entrypoint:
+    - '/usr/bin/env'
+    - 'PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+
+variables:
+  PLAN: "plan.tfplan"
+  PLAN_JSON: "tfplan.json"
+  GITLAB_TF_ADDRESS: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/terraform/state/production
+
+before_script:
+  - apk --no-cache add jq curl
+  - alias convert_report="jq -r '([.resource_changes[]?.change.actions?]|flatten)|{\"create\":(map(select(.==\"create\"))|length),\"update\":(map(select(.==\"update\"))|length),\"delete\":(map(select(.==\"delete\"))|length)}'"
+  - terraform --version
+  - >
+    terraform init -backend-config="address=${GITLAB_TF_ADDRESS}"
+    -backend-config="lock_address=${GITLAB_TF_ADDRESS}/lock" 
+    -backend-config="unlock_address=${GITLAB_TF_ADDRESS}/lock"
+    -backend-config="username=gitlab-ci-token"
+    -backend-config="password=${CI_JOB_TOKEN}"
+    -backend-config="lock_method=POST"
+    -backend-config="unlock_method=DELETE"
+    -backend-config="retry_wait_min=5"
+
+stages:
+  - validate
+  - plan
+  - deploy
+
+validate:
+  stage: validate
+  tags:
+    - docker
+  script:
+    - terraform validate
+    - terraform fmt -check=true -write=false -diff=true
+
+plan:
+  stage: plan
+  except:
+    - schedules
+  artifacts:
+    reports:
+      terraform: $PLAN_JSON
+    paths:
+      - $PLAN
+  script:
+    - terraform plan -out=$PLAN
+    - terraform show --json $PLAN | convert_report > $PLAN_JSON
+
+drift:
+  stage: plan
+  artifacts:
+    name: plan
+    paths:
+      - $PLAN
+  script:
+    - terraform plan -detailed-exitcode -out=$PLAN 2> /dev/null || ec=$?
+    - |
+      case $ec in
+        0) echo "No Changes Found"; exit 0;;
+        1) printf '%s\n' "Command exited with non-zero"; exit 1;;
+        2) echo "Drift Detected";
+           terraform show $PLAN > details
+           datajson="{\"chat_id\":\"${TELEGRAM_CHAT}\", \"text\": \"YCloud drift detected ${CI_JOB_URL}\"}";
+           echo $datajson;
+           curl --request POST \
+           --data "${datajson}" \
+           --header 'Content-Type: application/json' \
+           ${TELEGRAM_BOT};
+      esac
+  only:
+    - schedules
+  resource_group: production
+
+deploy:
+  stage: deploy
+  when: manual
+  dependencies:						    
+    - plan
+  except:
+    - schedules
+  only:
+    - main
+  script:
+    - terraform apply -auto-approve
